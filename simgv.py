@@ -37,7 +37,7 @@ class ImageViewer(Gtk.ApplicationWindow):
         self.setup_controllers()
         self.setup_css()
 
-        GLib.timeout_add(500, self.update_time_label)
+        GLib.timeout_add(100, self.update_time_label)
 
     def setup_ui(self):
         # main box containing the viewer and bottom bar
@@ -256,6 +256,10 @@ class ImageViewer(Gtk.ApplicationWindow):
     def load_file(self, filepath):
         content_type, _ = Gio.content_type_guess(filepath, None)
 
+        if self.player:
+            self.player.set_state(Gst.State.NULL)
+            self.player.set_property("uri", None)
+
         if content_type and content_type.startswith("video/") and self.player:
             self.load_video(filepath)
         else:
@@ -297,10 +301,11 @@ class ImageViewer(Gtk.ApplicationWindow):
         # THEN grab the paintable and give it to the picture widget
         paintable = self.gtk_sink.get_property("paintable")
         self.picture.set_paintable(paintable)
+
+        self.picture.set_opacity(0.0)
         
         self.has_image = True
-
-        self.resolution_label.set_text("Video")
+        self.resolution_label.set_text("Loading...")
         self.filename_label.set_text(file.get_basename())
         self.set_fsize_label(file)
         
@@ -342,6 +347,25 @@ class ImageViewer(Gtk.ApplicationWindow):
                 pos_str = self.format_time(position)
                 dur_str = self.format_time(duration)
                 self.time_label.set_text(f"{pos_str}/{dur_str}")
+
+            paintable = self.picture.get_paintable()
+            if paintable:
+                w = paintable.get_intrinsic_width()
+                h = paintable.get_intrinsic_height()
+
+                if w > 0 and h > 0:
+
+                    if self.picture.get_opacity() == 0.0:
+                        self.picture.set_opacity(1.0)
+
+                    curr = self.resolution_label.get_text()
+                    new = f"{w}x{h}px"
+
+                    if curr != new:
+                        self.resolution_label.set_text(new)
+
+                        if self.is_fitted:
+                            self.reset_view()
         else:
             self.time_label.set_text("")
 
@@ -477,6 +501,16 @@ class ImageViewer(Gtk.ApplicationWindow):
                     elif state == Gst.State.PAUSED:
                         self.player.set_state(Gst.State.PLAYING)
                         handled = True
+
+        elif keyval == Gdk.KEY_r:
+            if self.player:
+                self.player.seek_simple(
+                    Gst.Format.TIME,
+                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                    0
+                )
+                self.player.set_state(Gst.State.PLAYING)
+                handled = True
 
         if handled:
             self.is_fitted = False
