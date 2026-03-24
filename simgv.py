@@ -3,6 +3,8 @@ import sys
 import os
 import gi
 
+os.environ["GSK_RENDERER"] = "gl"
+
 gi.require_version('Gtk', '4.0')
 gi.require_version('Gdk', '4.0')
 gi.require_version('Gsk', '4.0')
@@ -10,8 +12,9 @@ gi.require_version('Graphene', '1.0')
 gi.require_version('Gio', '2.0')
 gi.require_version('GLib', '2.0')
 gi.require_version('Pango', '1.0')
+gi.require_version('Gst', '1.0')
 
-from gi.repository import Gtk, Gdk, Gsk, Graphene, Gio, GLib, Pango
+from gi.repository import Gtk, Gdk, Gsk, Graphene, Gio, GLib, Pango, Gst
 
 class ImageViewer(Gtk.ApplicationWindow):
     def __init__(self, app):
@@ -34,6 +37,8 @@ class ImageViewer(Gtk.ApplicationWindow):
         self.setup_controllers()
         self.setup_css()
 
+        GLib.timeout_add(500, self.update_time_label)
+
     def setup_ui(self):
         # main box containing the viewer and bottom bar
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -55,6 +60,15 @@ class ImageViewer(Gtk.ApplicationWindow):
         self.fixed = Gtk.Fixed()
         self.fixed.add_css_class("viewer-canvas")
         self.viewport.set_overflow(Gtk.Overflow.HIDDEN)
+
+        self.player = Gst.ElementFactory.make("playbin", "player")
+        self.gtk_sink = Gst.ElementFactory.make("gtk4paintablesink", "gtk_sink")
+
+        if not self.gtk_sink:
+            print("WARNING: gtk4paintablesink not found")
+            self.player = None
+        else:
+            self.player.set_property("video-sink", self.gtk_sink)
         
         self.picture = Gtk.Picture()
         self.picture.set_can_shrink(False)
@@ -73,11 +87,13 @@ class ImageViewer(Gtk.ApplicationWindow):
         self.size_label = Gtk.Label(label="")
         self.resolution_label = Gtk.Label(label="")
         self.zoom_label = Gtk.Label(label="")
+        self.time_label = Gtk.Label(label="")
 
         bottom_bar.append(self.filename_label)
         bottom_bar.append(self.size_label)
         bottom_bar.append(self.resolution_label)
         bottom_bar.append(self.zoom_label)
+        bottom_bar.append(self.time_label)
 
         vbox.append(bottom_bar)
 
@@ -172,6 +188,7 @@ class ImageViewer(Gtk.ApplicationWindow):
         image_filter.set_name("Images")
 
         image_filter.add_mime_type("image/*")
+        image_filter.add_mime_type("video/*")
 
         filters = Gio.ListStore.new(Gtk.FileFilter)
         filters.append(image_filter)
@@ -192,7 +209,7 @@ class ImageViewer(Gtk.ApplicationWindow):
         try:
             file = dialog.open_finish(response)
             if file is not None:
-                self.load_image(file.get_path())
+                self.load_file(file.get_path())
 
         except GLib.Error as e:
             if e.matches(Gtk.DialogError.quark(), Gtk.DialogError.DISMISSED):
@@ -208,8 +225,11 @@ class ImageViewer(Gtk.ApplicationWindow):
         if not texture: 
             return False
 
-        img_w = texture.get_width()
-        img_h = texture.get_height()
+        img_w = texture.get_intrinsic_width()
+        img_h = texture.get_intrinsic_height()
+
+        if img_w <= 0 or img_h <= 0:
+            return True
         
         view_w = self.viewport.get_width()
         view_h = self.viewport.get_height()
@@ -233,7 +253,18 @@ class ImageViewer(Gtk.ApplicationWindow):
         
         return False
 
+    def load_file(self, filepath):
+        content_type, _ = Gio.content_type_guess(filepath, None)
+
+        if content_type and content_type.startswith("video/") and self.player:
+            self.load_video(filepath)
+        else:
+            self.load_image(filepath)
+        
     def load_image(self, filepath):
+        if self.player:
+            self.player.set_state(Gst.State.NULL)
+        
         file = Gio.File.new_for_path(filepath)
         try:
             texture = Gdk.Texture.new_from_file(file)
@@ -254,6 +285,27 @@ class ImageViewer(Gtk.ApplicationWindow):
 
         self.is_fitted = True
         self.reset_view()
+        
+    def load_video(self, filepath):
+        self.player.set_state(Gst.State.NULL)
+        file = Gio.File.new_for_path(filepath)
+        self.player.set_property("uri", file.get_uri())
+        
+        # Start playback FIRST
+        self.player.set_state(Gst.State.PLAYING)
+        
+        # THEN grab the paintable and give it to the picture widget
+        paintable = self.gtk_sink.get_property("paintable")
+        self.picture.set_paintable(paintable)
+        
+        self.has_image = True
+
+        self.resolution_label.set_text("Video")
+        self.filename_label.set_text(file.get_basename())
+        self.set_fsize_label(file)
+        
+        self.is_fitted = True
+        GLib.idle_add(self.reset_view)
 
     def set_fsize_label(self, file):
         # self.size_label.set_text(str(file.measure_disk_usage(Gio.FileMeasureFlags.NONE, None, None, None)[1]))
@@ -265,6 +317,35 @@ class ImageViewer(Gtk.ApplicationWindow):
             fsize /= 1024
             n += 1
         self.size_label.set_text(f"{fsize:.2f}{a[n]}")
+
+    def format_time(self, ns):
+        if ns < 0:
+            return "00:00"
+
+        total_sec = ns // 1_000_000_000
+        min = total_sec // 60
+        sec = total_sec % 60
+
+        return f"{min:02d}:{sec:02d}"
+
+    def update_time_label(self):
+        if not self.player or not self.has_image:
+            self.time_label.set_text("")
+            return True
+
+        _, state, _ = self.player.get_state(0)
+        if state in (Gst.State.PAUSED, Gst.State.PLAYING):
+            has_pos, position = self.player.query_position(Gst.Format.TIME)
+            has_dur, duration = self.player.query_duration(Gst.Format.TIME)
+
+            if has_dur and has_pos:
+                pos_str = self.format_time(position)
+                dur_str = self.format_time(duration)
+                self.time_label.set_text(f"{pos_str}/{dur_str}")
+        else:
+            self.time_label.set_text("")
+
+        return True
         
     def update_transform(self):
         if not self.has_image: return
@@ -367,9 +448,35 @@ class ImageViewer(Gtk.ApplicationWindow):
                 handled = True
 
         # reset view keybind
-        elif keyval == Gdk.KEY_space:
+        elif keyval == Gdk.KEY_Escape:
             self.reset_view()
             return True # exit bc dont need to update transform with reset_view
+
+        elif keyval == Gdk.KEY_space:
+            if self.player:
+                has_pos, position = self.player.query_position(Gst.Format.TIME)
+                has_dur, duration = self.player.query_duration(Gst.Format.TIME)
+
+                is_finished = has_pos and has_dur and duration > 0 and (duration - position) < 100_000_000
+
+                if is_finished:
+                    self.player.seek_simple(
+                        Gst.Format.TIME,
+                        Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                        0
+                    )
+                    self.player.set_state(Gst.State.PLAYING)
+                    handled = True
+                
+                else:
+                    _, state, _ = self.player.get_state(0)
+
+                    if state == Gst.State.PLAYING:
+                        self.player.set_state(Gst.State.PAUSED)
+                        handled = True
+                    elif state == Gst.State.PAUSED:
+                        self.player.set_state(Gst.State.PLAYING)
+                        handled = True
 
         if handled:
             self.is_fitted = False
@@ -385,6 +492,7 @@ class ImageViewerApp(Gtk.Application):
             application_id="com.example.ImageViewer",
             flags=Gio.ApplicationFlags.HANDLES_OPEN
         )
+        Gst.init(None)
 
     def do_activate(self):
         win = self.props.active_window
@@ -399,7 +507,7 @@ class ImageViewerApp(Gtk.Application):
         if n_files > 0:
             file_path = files[0].get_path()
             if file_path:
-                win.load_image(file_path)
+                win.load_file(file_path)
         
 
 if __name__ == "__main__":
